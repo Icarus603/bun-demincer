@@ -32,14 +32,20 @@ const require = createRequire(import.meta.url);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// @wakaru/unminify ESM dist has a broken prettier import (no .js extension),
+// so we use CJS require which resolves fine.
+const { runTransformationRules } = require("@wakaru/unminify");
+
 // ── Argument parsing ──────────────────────────────────────────────
 
 function parseArgs() {
   const args = process.argv.slice(2);
+  const defaultSkip = new Set(["lebab"]);
   const opts = {
     dir: null,
+    manifest: null, // path to manifest.json for collision resolution
     batch: [],  // multiple batch files supported
-    skip: new Set(),
+    skip: defaultSkip,
     only: null, // if set, run only this stage
     concurrency: 4,
   };
@@ -61,6 +67,10 @@ function parseArgs() {
         break;
       case "--only":
         opts.only = args[++i];
+        i++;
+        break;
+      case "--manifest":
+        opts.manifest = args[++i];
         i++;
         break;
       case "--concurrency":
@@ -94,46 +104,78 @@ Usage: node deobfuscate.mjs --dir <path> [options]
 Options:
   --dir <path>         Directory containing split .js files (required)
   --batch <path>       Rename JSON file for the rename stage
+  --manifest <path>    Manifest JSON for collision resolution (auto-detected if in --dir)
   --skip <stage>       Skip a stage (wakaru, lebab, extract, extract-names, rename, prettier)
   --only <stage>       Run only this stage
-  --concurrency <n>    Max concurrent wakaru processes (default: 4)
+  --concurrency <n>    Max concurrent wakaru transforms (default: 4)
   -h, --help           Show this help
 
 Stages: wakaru → lebab → extract → extract-names → rename → prettier
+  lebab is skipped by default (wakaru's internal lebab rule handles safe transforms)
   extract auto-generates a rename map from MR() export mappings
   extract-names finds renames from this.name/displayName patterns
   `);
 }
 
-// ── Stage 1: wakaru unminify ──────────────────────────────────────
+// ── Stage 1: wakaru unminify (programmatic API) ──────────────────
+
+// Safe transform rules — excludes rules that break CJS bundles or conflict
+// with our pipeline. Rule order matches wakaru's default pipeline order.
+const SAFE_WAKARU_RULES = [
+  // 'prettier' — skip, we have our own prettier stage
+  // 'module-mapping' — skip, may interfere with module system
+  "un-curly-braces",
+  "un-sequence-expression",
+  "un-variable-merging",
+  "un-assignment-merging",
+  "un-runtime-helper",
+  // 'un-esm' — skip, interferes with CJS wrapper
+  "un-enum",
+  // 'lebab' — skip, converts var→let/const which breaks reassembly (duplicate let in same scope)
+  "un-export-rename",
+  // 'un-use-strict' — skip, removing "use strict" is a behavioral change
+  // 'un-esmodule-flag' — skip, interferes with CJS interop
+  "un-boolean",
+  "un-undefined",
+  "un-infinity",
+  "un-typeof",
+  "un-numeric-literal",
+  "un-template-literal",
+  "un-bracket-notation",
+  "un-return",
+  "un-while-loop",
+  "un-indirect-call",
+  "un-type-constructor",
+  "un-builtin-prototype",
+  "un-sequence-expression",
+  "un-flip-comparisons",
+  "un-iife",
+  "un-import-rename",
+  "smart-inline",
+  // 'smart-rename' — skip, conflicts with our rename pipeline
+  "un-optional-chaining",
+  "un-nullish-coalescing",
+  "un-conditionals",
+  "un-sequence-expression",
+  "un-parameters",
+  "un-argument-spread",
+  // 'un-jsx' — skip, converts createElement to JSX (breaks CJS in Bun)
+  "un-es6-class",
+  "un-async-await",
+  // 'prettier-1' — skip, we have our own prettier stage
+];
 
 async function stageWakaru(dir, files, concurrency) {
   console.log("\n━━━ Stage 1: wakaru unminify ━━━");
-
-  // wakaru requires input files inside CWD and outputs to an output dir.
-  // Strategy: run wakaru with CWD=dir, output to .wakaru-out, copy back.
-  const result = await runWakaru(dir, files, concurrency);
-
-  console.log(
-    `  Processed ${result.processed}/${files.length} files` +
-      (result.errors > 0 ? ` (${result.errors} errors)` : "")
-  );
-  console.log("  Done.");
-}
-
-async function runWakaru(cwd, files, concurrency) {
-  const outDir = path.join(cwd, ".wakaru-out");
-  fs.rmSync(outDir, { recursive: true, force: true });
+  console.log(`  Using programmatic API with ${SAFE_WAKARU_RULES.length} safe rules`);
 
   const LARGE_FILE_THRESHOLD = 500_000; // 500KB
-  const LARGE_FILE_TIMEOUT = 600_000;   // 10 min
-  const NORMAL_TIMEOUT = 180_000;       // 3 min
 
   // Separate large files from normal ones
   const largeFiles = [];
   const normalFiles = [];
   for (const f of files) {
-    const filePath = path.join(cwd, f);
+    const filePath = path.join(dir, f);
     const size = fs.statSync(filePath).size;
     if (size > LARGE_FILE_THRESHOLD) {
       largeFiles.push(f);
@@ -143,88 +185,51 @@ async function runWakaru(cwd, files, concurrency) {
   }
 
   if (largeFiles.length > 0) {
-    console.log(`  Large files (>500KB, extended timeout): ${largeFiles.join(", ")}`);
+    console.log(`  Large files (>500KB, serial): ${largeFiles.join(", ")}`);
   }
 
   let processed = 0;
   let errors = 0;
 
-  // Process large files one at a time with extended timeout
-  for (const f of largeFiles) {
+  // Transform a single file
+  async function transformFile(f) {
+    const filePath = path.join(dir, f);
+    const source = fs.readFileSync(filePath, "utf-8");
     try {
-      execSync(
-        `npx @wakaru/cli unminify ${JSON.stringify(f)} -o .wakaru-out -f`,
-        {
-          cwd,
-          stdio: ["pipe", "pipe", "pipe"],
-          timeout: LARGE_FILE_TIMEOUT,
-        }
+      const result = await runTransformationRules(
+        { path: f, source },
+        SAFE_WAKARU_RULES,
       );
-    } catch (err) {
-      // wakaru may partially succeed — we check output below
-    }
-
-    const outPath = path.join(outDir, f);
-    if (fs.existsSync(outPath)) {
+      if (result.code && result.code !== source) {
+        fs.writeFileSync(filePath, result.code, "utf-8");
+      }
       processed++;
-    } else {
-      console.warn(`  Warning: wakaru failed on ${f} (large file)`);
+    } catch (err) {
+      console.warn(`  Warning: wakaru failed on ${f}: ${err.message}`);
       errors++;
     }
     process.stdout.write(
-      `  ${path.basename(cwd)}: ${processed}/${files.length} files\r`
+      `  ${path.basename(dir)}: ${processed + errors}/${files.length} files\r`
     );
   }
 
-  // Process normal files in batches
-  const batches = [];
+  // Process large files one at a time
+  for (const f of largeFiles) {
+    await transformFile(f);
+  }
+
+  // Process normal files in batches with concurrency
   for (let i = 0; i < normalFiles.length; i += concurrency) {
-    batches.push(normalFiles.slice(i, i + concurrency));
-  }
-
-  for (const batch of batches) {
-    const fileArgs = batch.map((f) => JSON.stringify(f)).join(" ");
-    try {
-      execSync(
-        `npx @wakaru/cli unminify ${fileArgs} -o .wakaru-out -f --concurrency ${batch.length}`,
-        {
-          cwd,
-          stdio: ["pipe", "pipe", "pipe"],
-          timeout: NORMAL_TIMEOUT,
-        }
-      );
-    } catch (err) {
-      // wakaru may partially succeed — we check output files below
-    }
-
-    // Check which files were output
-    for (const f of batch) {
-      const outPath = path.join(outDir, f);
-      if (fs.existsSync(outPath)) {
-        processed++;
-      } else {
-        console.warn(`  Warning: wakaru failed on ${f}`);
-        errors++;
-      }
-    }
-    process.stdout.write(
-      `  ${path.basename(cwd)}: ${processed}/${files.length} files\r`
-    );
+    const batch = normalFiles.slice(i, i + concurrency);
+    await Promise.all(batch.map(transformFile));
   }
   console.log();
 
-  // Copy results back (overwrite originals)
-  for (const f of files) {
-    const outPath = path.join(outDir, f);
-    if (fs.existsSync(outPath)) {
-      fs.copyFileSync(outPath, path.join(cwd, f));
-    }
-  }
-
-  // Clean up
-  fs.rmSync(outDir, { recursive: true, force: true });
-
-  return { processed, errors };
+  console.log(
+    `  Processed ${processed}/${files.length} files` +
+      (errors > 0 ? ` (${errors} errors)` : "")
+  );
+  console.log("  Done.");
 }
 
 // ── Stage 2: lebab ────────────────────────────────────────────────
@@ -359,7 +364,44 @@ function stageExtractNames(dir, existingBatchFiles) {
 
 // ── Stage 4: rename.mjs ──────────────────────────────────────────
 
-function stageRename(dir, batchFiles) {
+/**
+ * Extract all identifiers declared in a runtime/skip file.
+ * These are Bun's module system plumbing (h, v, y, MR, etc.) referenced by
+ * ALL modules including vendor — renaming them in app code would break vendor
+ * code that still references the original names.
+ */
+function extractRuntimeIdentifiers(filePath) {
+  const code = fs.readFileSync(filePath, "utf-8");
+  const ids = new Set();
+  // var declarations (including comma-separated: var A,B,C=...)
+  for (const m of code.matchAll(/var\s+([\s\S]*?)(?=;(?:var\b|function\b|class\b|\s*$))/g)) {
+    for (const id of m[1].matchAll(/([A-Za-z_$][\w$]*)\s*(?=[=,;])/g)) {
+      ids.add(id[1]);
+    }
+  }
+  // Standalone var without assignment
+  for (const m of code.matchAll(/var\s+([A-Za-z_$][\w$]*)\s*[,;]/g)) ids.add(m[1]);
+  // function declarations
+  for (const m of code.matchAll(/function\s+([A-Za-z_$][\w$]*)/g)) ids.add(m[1]);
+  // Destructured imports: var{x:alias,...}=Object
+  for (const m of code.matchAll(/var\s*\{([^}]+)\}/g)) {
+    for (const pair of m[1].split(",")) {
+      const colonMatch = pair.match(/:\s*([A-Za-z_$][\w$]*)/);
+      if (colonMatch) ids.add(colonMatch[1]);
+      else {
+        const plain = pair.trim().match(/^([A-Za-z_$][\w$]*)/);
+        if (plain) ids.add(plain[1]);
+      }
+    }
+  }
+  // Remove built-in names that happen to appear
+  for (const builtin of ["Object", "WeakMap", "exports", "TypeError", "Promise", "SuppressedError", "Symbol"]) {
+    ids.delete(builtin);
+  }
+  return ids;
+}
+
+function stageRename(dir, batchFiles, manifestPath, skipFiles) {
   console.log("\n━━━ Stage 4: rename (AST identifier rename) ━━━");
 
   if (!batchFiles || batchFiles.length === 0) {
@@ -386,13 +428,41 @@ function stageRename(dir, batchFiles) {
     return;
   }
 
+  // Exclude runtime identifiers — these are Bun module system globals referenced
+  // by all files including vendor. Renaming them in app code would break vendor.
+  const runtimeExclusions = new Set();
+  for (const sf of skipFiles) {
+    const sfPath = path.join(dir, sf);
+    if (fs.existsSync(sfPath)) {
+      for (const id of extractRuntimeIdentifiers(sfPath)) {
+        runtimeExclusions.add(id);
+      }
+    }
+  }
+  const excluded = [];
+  for (const id of runtimeExclusions) {
+    if (id in merged) {
+      excluded.push(`${id} → ${merged[id]}`);
+      delete merged[id];
+    }
+  }
+  if (excluded.length > 0) {
+    console.log(`  Excluded ${excluded.length} runtime identifier(s): ${excluded.join(", ")}`);
+  }
+
+  if (Object.keys(merged).length === 0) {
+    console.log("  Skipped (no renames to apply after exclusions)");
+    return;
+  }
+
   // Write merged renames to temp file
   const tmpBatch = path.join(dir, ".rename-batch-tmp.json");
   fs.writeFileSync(tmpBatch, JSON.stringify(merged, null, 2));
 
+  const manifestFlag = manifestPath ? ` --manifest "${manifestPath}"` : "";
   try {
     const output = execSync(
-      `node "${renameMjs}" --batch "${tmpBatch}" --dir "${dir}"`,
+      `node "${renameMjs}" --batch "${tmpBatch}" --dir "${dir}"${manifestFlag}`,
       {
         cwd: __dirname,
         stdio: ["pipe", "pipe", "pipe"],
@@ -490,11 +560,22 @@ async function main() {
     process.exit(1);
   }
 
-  // Find all app JS files (exclude manifest.json and vendor/ — vendor modules are
-  // identified npm packages and don't need deobfuscation)
+  // Auto-detect manifest.json in --dir if not explicitly provided
+  if (!opts.manifest) {
+    const autoManifest = path.join(dir, "manifest.json");
+    if (fs.existsSync(autoManifest)) {
+      opts.manifest = autoManifest;
+      console.log(`Auto-detected manifest: ${autoManifest}`);
+    }
+  }
+  const manifestPath = opts.manifest ? path.resolve(opts.manifest) : null;
+
+  // Find all app JS files (exclude manifest.json, vendor/, and special non-module
+  // files like runtime/main that contain Bun internals and must not be transformed)
+  const SKIP_FILES = new Set(["00-runtime.js", "99-main.js"]);
   const allFiles = fs
     .readdirSync(dir)
-    .filter((f) => f.endsWith(".js"))
+    .filter((f) => f.endsWith(".js") && !SKIP_FILES.has(f))
     .sort();
 
   const vendorDir = path.join(dir, "vendor");
@@ -538,7 +619,7 @@ async function main() {
         }
         break;
       case "rename":
-        stageRename(dir, opts.batch);
+        stageRename(dir, opts.batch, manifestPath, SKIP_FILES);
         // Clean up auto-generated renames files
         if (autoRenamesFile) {
           fs.rmSync(autoRenamesFile, { force: true });

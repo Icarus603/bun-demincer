@@ -79,7 +79,7 @@ function reassemble(splitDir, outFile) {
   }
 
   const inner = parts.join("");
-  const wrapped = `// Bun bundle (reassembled)\n(function(exports, require, module, __filename, __dirname) {${inner}})`;
+  const wrapped = `// @bun @bytecode @bun-cjs\n(function(exports, require, module, __filename, __dirname) {${inner}})`;
 
   writeFileSync(outFile, wrapped);
   console.log(`Wrote ${(wrapped.length / 1024 / 1024).toFixed(1)}MB to ${outFile}`);

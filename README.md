@@ -16,7 +16,10 @@ Bun binary (opaque executable)
   → cluster modules by dependency graph (Louvain community detection)
   → organize into semantic directories
   → readable, organized source code
+  → reassemble back into a working binary (round-trip)
 ```
+
+The deobfuscated code is not just readable — it's **runnable**. You can modify individual module files and reassemble them back into a working Bun binary.
 
 ## Quick start
 
@@ -62,6 +65,20 @@ node src/organize.mjs decoded/
 ```
 
 Steps 1-5 are fully automated. Steps 6-9 organize the output into directories — step 8 requires manual labeling (or an LLM).
+
+### Round-trip: reassemble and run
+
+After deobfuscating (and optionally modifying) individual module files, reassemble them back into a working binary:
+
+```bash
+# Reassemble deobfuscated modules into a runnable bundle
+node scripts/build.mjs <version-dir> --source decoded --no-bun-cjs
+
+# Run it
+cd <version-dir>/extracted && bun run.js --version
+```
+
+The `--no-bun-cjs` flag wraps the code as a self-executing IIFE instead of relying on Bun's strict `@bun-cjs` CJS loader, which requires byte-exact formatting incompatible with any code transformation.
 
 ### With AI-assisted renaming (optional, improves readability)
 
@@ -128,11 +145,13 @@ The fingerprint DB (`data/vendor-fingerprints-1000.json`, 26MB) covers 23,746 fi
 
 ### Deobfuscation pipeline
 
-1. **wakaru** — structural transforms: `!0`→`true`, `void 0`→`undefined`, comma splitting, `var`→`const/let`
-2. **lebab** — ES5→ES6+ modernization
+1. **wakaru** — structural transforms: `!0`→`true`, `void 0`→`undefined`, comma splitting
+2. **lebab** — ES5→ES6+ modernization (skipped by default — `var`→`let/const` causes cross-file collisions when reassembled)
 3. **extract** — auto-generate rename maps from `MR()` export mappings + `this.name`/`displayName` patterns
-4. **rename** — AST-based identifier rename via Babel (batch JSON files)
+4. **rename** — format-preserving AST rename via recast (only identifier bytes change, everything else stays byte-identical)
 5. **prettier** — consistent formatting
+
+Runtime files (`00-runtime.js`, `99-main.js`) are automatically excluded from wakaru/lebab/prettier. Identifiers declared in runtime files (Bun's module system globals like `h`, `v`, `y`, `MR`) are auto-excluded from renames — they're referenced by all modules including vendor.
 
 ### Name recovery
 
@@ -173,16 +192,17 @@ After deobfuscation, modules are flat numbered files. The organization pipeline 
 | Script | Description |
 |--------|-------------|
 | `src/extract.mjs` | Parse Bun binary format, extract all embedded modules |
-| `src/resplit.mjs` | Split bundle into 1-module-per-file. `--reassemble` to recombine |
+| `src/resplit.mjs` | Split bundle into 1-module-per-file |
 | `src/match-vendors.mjs` | Vendor classification: fingerprint DB + flood-fill. `--classify`, `--no-move` |
 | `src/deobfuscate.mjs` | Full pipeline: wakaru → lebab → extract → rename → prettier |
 | `src/reconstruct-imports.mjs` | Convert internal markers → ES import/export statements |
+| `build.mjs` (in project) | Reassemble modules into runnable bundle. `--no-bun-cjs`, `--run` |
 
 ### Name Recovery
 
 | Script | Description |
 |--------|-------------|
-| `src/rename.mjs` | AST-aware identifier rename (Babel). Single, batch JSON, `--dry-run` |
+| `src/rename.mjs` | Format-preserving AST rename (recast). Single, batch JSON, `--dry-run` |
 | `src/extract-exports.mjs` | Auto-extract `MR()` export mappings → rename JSON |
 | `src/extract-names.mjs` | Extract renames from `this.name="X"` + `displayName="X"` patterns |
 | `src/extract-tools.mjs` | Extract names from `userFacingName()` patterns |
