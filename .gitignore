@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+
+# OS
+.DS_Store
+
+# Generated output directories (from pipeline runs)
+extracted/
+resplit/
+decoded/
+decoded-organized/
+
+# Generated artifacts
+deps-graph.json
+clusters-core.json
+cluster-labels.json
+clusters*.png
+*.progress.json
+.wakaru-out/
+
+# Reassembled bundles
+reassembled.js
