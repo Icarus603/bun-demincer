@@ -142,13 +142,18 @@ function charOffsetToLine(offsetInCode) {
 
 const preamble = code.slice(0, 5000);
 
+// Auto-detect __commonJS: (P1, P2) => () => (P2 || P1((P2 = {exports: {}}).exports, P2), P2.exports)
+// Parameter names vary per build (T,R in some versions, p,x in others)
+// Leading context varies: comma-separated (,y=) or var-declared (var I=)
+const ID = "[A-Za-z_$][A-Za-z0-9_$]*";
 const factoryMatch = preamble.match(
-  /,\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*\(T,\s*R\)\s*=>\s*\(\)\s*=>\s*\(\s*R\s*\|\|\s*T\s*\(\s*\(\s*R\s*=\s*\{\s*exports\s*:\s*\{\s*\}/
+  new RegExp(`(?:,|var\\s+)(${ID})\\s*=\\s*\\((${ID}),\\s*(${ID})\\)\\s*=>\\s*\\(\\)\\s*=>\\s*\\(\\s*\\3\\s*\\|\\|\\s*\\2\\s*\\(\\s*\\(\\s*\\3\\s*=\\s*\\{\\s*exports\\s*:\\s*\\{\\s*\\}`)
 );
 const factoryFn = factoryMatch ? factoryMatch[1] : null;
 
+// Auto-detect __esm: (P1, P2) => () => (P1 && (P2 = P1(P1 = 0)), P2)
 const lazyMatch = preamble.match(
-  /var\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*\(T,\s*R\)\s*=>\s*\(\)\s*=>\s*\(\s*T\s*&&\s*\(\s*R\s*=\s*T\s*\(\s*T\s*=\s*0\s*\)\s*\)\s*,\s*R\s*\)/
+  new RegExp(`(?:,|var\\s+)(${ID})\\s*=\\s*\\((${ID}),\\s*(${ID})\\)\\s*=>\\s*\\(\\)\\s*=>\\s*\\(\\s*\\2\\s*&&\\s*\\(\\s*\\3\\s*=\\s*\\2\\s*\\(\\s*\\2\\s*=\\s*0\\s*\\)\\s*\\)\\s*,\\s*\\3\\s*\\)`)
 );
 const lazyFn = lazyMatch ? lazyMatch[1] : null;
 
