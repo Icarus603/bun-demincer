@@ -112,40 +112,11 @@ async function stageWakaru(dir, files, concurrency) {
 
   // wakaru requires input files inside CWD and outputs to an output dir.
   // Strategy: run wakaru with CWD=dir, output to .wakaru-out, copy back.
-  //
-  // For vendor/ files, group by directory and process each separately.
-  const topFiles = files.filter((f) => !f.includes(path.sep));
-  const vendorByDir = new Map(); // dir -> [basename, ...]
-  for (const f of files) {
-    if (!f.startsWith("vendor" + path.sep)) continue;
-    const vendorSubdir = path.dirname(f); // e.g., "vendor/rxjs" or "vendor"
-    const absDir = path.join(dir, vendorSubdir);
-    if (!vendorByDir.has(absDir)) vendorByDir.set(absDir, []);
-    vendorByDir.get(absDir).push(path.basename(f));
-  }
-
-  let processed = 0;
-  let errors = 0;
-
-  // Process top-level files
-  if (topFiles.length > 0) {
-    const result = await runWakaru(dir, topFiles, concurrency);
-    processed += result.processed;
-    errors += result.errors;
-  }
-
-  // Process vendor files (per directory)
-  for (const [vendorDir, vendorFiles] of vendorByDir) {
-    if (vendorFiles.length > 0 && fs.existsSync(vendorDir)) {
-      const result = await runWakaru(vendorDir, vendorFiles, concurrency);
-      processed += result.processed;
-      errors += result.errors;
-    }
-  }
+  const result = await runWakaru(dir, files, concurrency);
 
   console.log(
-    `  Processed ${processed}/${files.length} files` +
-      (errors > 0 ? ` (${errors} errors)` : "")
+    `  Processed ${result.processed}/${files.length} files` +
+      (result.errors > 0 ? ` (${result.errors} errors)` : "")
   );
   console.log("  Done.");
 }
@@ -519,33 +490,19 @@ async function main() {
     process.exit(1);
   }
 
-  // Find all JS files (exclude manifest.json, vendor/ handled separately)
-  const files = fs
+  // Find all app JS files (exclude manifest.json and vendor/ — vendor modules are
+  // identified npm packages and don't need deobfuscation)
+  const allFiles = fs
     .readdirSync(dir)
     .filter((f) => f.endsWith(".js"))
     .sort();
 
-  // Also process vendor/ if it exists (supports flat, nested, and scoped pkg dirs)
   const vendorDir = path.join(dir, "vendor");
-  const vendorFiles = [];
-  if (fs.existsSync(vendorDir)) {
-    function scanVendorDir(absDir, relDir) {
-      for (const entry of fs.readdirSync(absDir)) {
-        const absPath = path.join(absDir, entry);
-        const stat = fs.statSync(absPath);
-        if (stat.isFile() && entry.endsWith(".js")) {
-          vendorFiles.push(path.join(relDir, entry));
-        } else if (stat.isDirectory() && entry !== ".wakaru-out") {
-          scanVendorDir(absPath, path.join(relDir, entry));
-        }
-      }
-    }
-    scanVendorDir(vendorDir, "vendor");
-  }
+  const vendorCount = fs.existsSync(vendorDir)
+    ? fs.readdirSync(vendorDir, { recursive: true }).filter(f => f.endsWith(".js")).length
+    : 0;
 
-  const allFiles = [...files, ...vendorFiles];
-
-  console.log(`Deobfuscation pipeline: ${allFiles.length} files in ${dir}`);
+  console.log(`Deobfuscation pipeline: ${allFiles.length} app files in ${dir}${vendorCount ? ` (skipping ${vendorCount} vendor files)` : ""}`);
 
   const stages = ["wakaru", "lebab", "extract", "extract-names", "rename", "prettier"];
   const activeStages = opts.only
