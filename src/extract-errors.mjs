@@ -279,20 +279,11 @@ function main() {
     process.exit(1);
   }
 
-  // Collect all .js files (including vendor/)
+  // Collect app .js files only (skip vendor/ — no renames generated from vendor code)
   const files = fs
     .readdirSync(opts.inputDir)
     .filter((f) => f.endsWith(".js"))
     .sort();
-
-  const vendorDir = path.join(opts.inputDir, "vendor");
-  if (fs.existsSync(vendorDir)) {
-    const vendorFiles = fs
-      .readdirSync(vendorDir)
-      .filter((f) => f.endsWith(".js"))
-      .map((f) => path.join("vendor", f));
-    files.push(...vendorFiles);
-  }
 
   if (files.length === 0) {
     console.error(`Error: no .js files found in ${opts.inputDir}`);

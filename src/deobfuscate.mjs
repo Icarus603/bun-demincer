@@ -151,9 +151,9 @@ const SAFE_WAKARU_RULES = [
   "un-flip-comparisons",
   "un-iife",
   "un-import-rename",
-  "smart-inline",
+  // "smart-inline" — disabled: can rewrite loop/index vars incorrectly (runtime breakage)
   // 'smart-rename' — skip, conflicts with our rename pipeline
-  "un-optional-chaining",
+  // "un-optional-chaining" — disabled: observed to drop enum namespace var declarations
   "un-nullish-coalescing",
   "un-conditionals",
   "un-sequence-expression",
@@ -462,11 +462,12 @@ function stageRename(dir, batchFiles, manifestPath, skipFiles) {
   const manifestFlag = manifestPath ? ` --manifest "${manifestPath}"` : "";
   try {
     const output = execSync(
-      `node "${renameMjs}" --batch "${tmpBatch}" --dir "${dir}"${manifestFlag}`,
+      `node "${renameMjs}" --batch "${tmpBatch}" --dir "${dir}"${manifestFlag} --smart`,
       {
         cwd: __dirname,
         stdio: ["pipe", "pipe", "pipe"],
-        timeout: 120000,
+        timeout: 600000,
+        maxBuffer: 50 * 1024 * 1024, // 50MB — full batch output can be very large
       }
     );
     const lines = output.toString().split("\n");
@@ -474,6 +475,12 @@ function stageRename(dir, batchFiles, manifestPath, skipFiles) {
       if (line.trim()) console.log(`  ${line}`);
     }
   } catch (err) {
+    // CRITICAL: maxBuffer overflow kills the rename process mid-way,
+    // leaving some files renamed and others not. Always report this.
+    const killed = err.killed || err.signal;
+    if (killed) {
+      console.error(`  ERROR: rename process was killed (${err.signal || 'maxBuffer?'}) — renames incomplete!`);
+    }
     if (err.stdout) {
       const lines = err.stdout.toString().split("\n");
       for (const line of lines) {
@@ -483,10 +490,14 @@ function stageRename(dir, batchFiles, manifestPath, skipFiles) {
     if (err.stderr) {
       console.warn(`  Rename stderr: ${err.stderr.toString().slice(0, 500)}`);
     }
+    const reason = killed
+      ? "Rename process killed (possibly maxBuffer overflow) — renames may be incomplete"
+      : `Rename stage failed with exit code ${err.status ?? "unknown"}`;
+    throw new Error(reason);
+  } finally {
+    // Clean up
+    fs.rmSync(tmpBatch, { force: true });
   }
-
-  // Clean up
-  fs.rmSync(tmpBatch, { force: true });
 
   console.log("  Done.");
 }
@@ -583,7 +594,12 @@ async function main() {
     ? fs.readdirSync(vendorDir, { recursive: true }).filter(f => f.endsWith(".js")).length
     : 0;
 
-  console.log(`Deobfuscation pipeline: ${allFiles.length} app files in ${dir}${vendorCount ? ` (skipping ${vendorCount} vendor files)` : ""}`);
+  console.log(
+    `Deobfuscation pipeline: ${allFiles.length} app files in ${dir}` +
+    (vendorCount
+      ? ` (structural stages skip ${vendorCount} vendor files; smart rename may update linked vendor references)`
+      : "")
+  );
 
   const stages = ["wakaru", "lebab", "extract", "extract-names", "rename", "prettier"];
   const activeStages = opts.only
