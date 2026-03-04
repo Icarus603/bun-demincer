@@ -20,6 +20,7 @@
  *
  * Options:
  *   --reference <ver>    Reference version (default: v2.1.63)
+ *   --layout <path>      Reference layout source (layout JSON file/dir)
  *   --out <dir>          Output directory (default: <targetDir>/transferred/)
  *   --dry-run            Show what would transfer, don't write
  *   --stats              Print transfer statistics
@@ -29,6 +30,7 @@
 import fs from "fs";
 import path from "path";
 import { execSync } from "child_process";
+import { fileURLToPath } from "url";
 
 /** Find the largest .js file in a directory (the main bundle) */
 function findLargestBundle(dir) {
@@ -43,8 +45,23 @@ function findLargestBundle(dir) {
   return best;
 }
 
-const __dirname = path.dirname(new URL(import.meta.url).pathname);
-const VERSIONS_DIR = path.join(__dirname, "versions");
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+function resolveVersionsDir() {
+  const candidates = [
+    path.join(process.cwd(), "versions"),
+    path.resolve(__dirname, "..", "versions"),
+    path.join(process.cwd(), "clau-decode", "versions"),
+    path.resolve(__dirname, "..", "..", "clau-decode", "versions"),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) return candidate;
+  }
+  return candidates[0];
+}
+
+const VERSIONS_DIR = resolveVersionsDir();
 
 // ─── Common properties to exclude (from diff-versions.mjs) ──────────────────
 
@@ -98,6 +115,7 @@ Arguments:
 
 Options:
   --reference <ver>    Reference version (default: v2.1.63)
+  --layout <path>      Reference layout source (layout JSON file/dir)
   --out <dir>          Output directory (default: <targetDir>/transferred/)
   --dry-run            Show what would transfer, don't write
   --stats              Print transfer statistics
@@ -118,6 +136,7 @@ function parseArgs() {
     stats: false,
     buildCache: false,
     cache: null,
+    layout: null,
     resplit: null,
     targetResplit: null,
   };
@@ -131,6 +150,7 @@ function parseArgs() {
     else if (a === "--stats") opts.stats = true;
     else if (a === "--build-cache") opts.buildCache = true;
     else if (a === "--cache") opts.cache = args[++i];
+    else if (a === "--layout") opts.layout = args[++i];
     else if (a === "--resplit") opts.resplit = args[++i];
     else if (a === "--target-resplit") opts.targetResplit = args[++i];
     else if (!opts.target) opts.target = a;
@@ -164,6 +184,61 @@ function extractVersionNumber(versionDir) {
   const base = path.basename(versionDir);
   const m = base.match(/_v([\d.]+)/);
   return m ? m[1] : base;
+}
+
+function loadModulesFromJsonFile(filePath) {
+  const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  if (!parsed || typeof parsed !== "object" || !parsed.modules || typeof parsed.modules !== "object") {
+    return null;
+  }
+  return parsed.modules;
+}
+
+function findLayoutJsonInDir(dirPath, refVer) {
+  if (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory()) return null;
+  const exact = path.join(dirPath, `layout-v${refVer}.json`);
+  if (fs.existsSync(exact)) return exact;
+  const entries = fs.readdirSync(dirPath).filter(n => /^layout-v[\d.]+\.json$/.test(n)).sort().reverse();
+  if (entries.length === 0) return null;
+  return path.join(dirPath, entries[0]);
+}
+
+function resolveReferenceLayout(refDir, refVer, explicitLayoutPath) {
+  const candidates = [];
+  if (explicitLayoutPath) candidates.push(path.resolve(explicitLayoutPath));
+  candidates.push(path.join(refDir, "artifacts", `layout-v${refVer}.json`));
+  candidates.push(path.join(refDir, "artifacts"));
+  candidates.push(path.join(__dirname, `layout-v${refVer}.json`));
+
+  for (const candidate of candidates) {
+    if (!candidate || !fs.existsSync(candidate)) continue;
+    const st = fs.statSync(candidate);
+    if (st.isFile()) {
+      const modules = loadModulesFromJsonFile(candidate);
+      if (modules) return { modules, sourcePath: candidate, sourceKind: "layout-json" };
+      continue;
+    }
+    if (st.isDirectory()) {
+      const layoutJson = findLayoutJsonInDir(candidate, refVer);
+      if (layoutJson) {
+        const modules = loadModulesFromJsonFile(layoutJson);
+        if (modules) return { modules, sourcePath: layoutJson, sourceKind: "layout-json" };
+      }
+      const manifestPath = path.join(candidate, "manifest.json");
+      if (fs.existsSync(manifestPath)) {
+        const modules = loadModulesFromJsonFile(manifestPath);
+        if (modules) return { modules, sourcePath: manifestPath, sourceKind: "manifest-fallback" };
+      }
+    }
+  }
+
+  const legacyManifest = path.join(refDir, "decoded-organized", "manifest.json");
+  if (fs.existsSync(legacyManifest)) {
+    const modules = loadModulesFromJsonFile(legacyManifest);
+    if (modules) return { modules, sourcePath: legacyManifest, sourceKind: "manifest-fallback" };
+  }
+
+  return null;
 }
 
 // ─── Ensure resplit (from diff-versions.mjs) ─────────────────────────────────
@@ -748,14 +823,16 @@ async function main() {
 
   console.error(`Transfer: v${refVer} → v${targetVer}${useCache ? " (using cache)" : ""}`);
 
-  // Load reference manifest (decoded-organized, the source of truth)
-  const refManifestPath = path.join(refDir, "decoded-organized", "manifest.json");
-  let refManifest = null;
-  if (fs.existsSync(refManifestPath)) {
-    refManifest = JSON.parse(fs.readFileSync(refManifestPath, "utf8"));
-    console.error(`Loaded reference manifest (${Object.keys(refManifest.modules).length} modules)`);
+  // Load reference layout metadata (JSON artifact preferred, manifest fallback)
+  const refLayout = resolveReferenceLayout(refDir, refVer, opts.layout);
+  let refLayoutModules = null;
+  if (refLayout) {
+    refLayoutModules = refLayout.modules;
+    console.error(
+      `Loaded reference layout (${Object.keys(refLayoutModules).length} modules) from ${refLayout.sourcePath} [${refLayout.sourceKind}]`,
+    );
   } else {
-    console.error(`Warning: no decoded-organized manifest found at ${refManifestPath}`);
+    console.error("Warning: no reference layout found (layout-v*.json or decoded-organized/manifest.json)");
   }
 
   let verRef, preambleRef;
@@ -827,7 +904,7 @@ async function main() {
 
   // ── Phase 3: Transfer Artifacts ────────────────────────────────────────
 
-  // 3a. Vendor + folder from reference manifest
+  // 3a. Vendor + folder from reference layout
   console.error(`Transferring vendor/folder metadata...`);
   const targetManifest = JSON.parse(fs.readFileSync(path.join(resplitTarget, "manifest.json"), "utf8"));
   const enrichedModules = {};
@@ -837,8 +914,8 @@ async function main() {
     const refId = matchTargetToRef.get(targetId);
     const enriched = { ...targetMeta };
 
-    if (refId && refManifest && refManifest.modules[refId]) {
-      const refMeta = refManifest.modules[refId];
+    if (refId && refLayoutModules && refLayoutModules[refId]) {
+      const refMeta = refLayoutModules[refId];
 
       // Copy vendor classification
       if (refMeta.vendor !== undefined) {
@@ -1073,6 +1150,8 @@ async function main() {
       _meta: {
         ...targetManifest._meta,
         transferredFrom: `v${refVer}`,
+        referenceLayoutSource: refLayout?.sourcePath || null,
+        referenceLayoutType: refLayout?.sourceKind || null,
         transferredAt: new Date().toISOString(),
         transferTool: "transfer-artifacts.mjs",
       },

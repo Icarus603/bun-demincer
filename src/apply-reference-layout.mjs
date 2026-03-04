@@ -14,16 +14,20 @@
  *   node apply-reference-layout.mjs <target-dir> [options]
  *
  * Options:
- *   --reference <dir>   Reference decoded-organized directory
- *                        (default: versions/2026-02-28_v2.1.63/decoded-organized)
+ *   --reference <path>  Reference layout source:
+ *                         - layout JSON artifact (preferred)
+ *                         - decoded-organized directory (manifest.json fallback)
+ *   --out <dir>         Write output to a new directory (copy target first)
  *   --dry-run           Show what would change, don't modify files
  *   --stats             Print detailed statistics
  */
 
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
 
-const __dirname = path.dirname(new URL(import.meta.url).pathname);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -31,7 +35,8 @@ function parseArgs() {
   const args = process.argv.slice(2);
   const opts = {
     target: null,
-    reference: path.join(__dirname, "versions/2026-02-28_v2.1.63/decoded-organized"),
+    reference: null,
+    out: null,
     dryRun: false,
     stats: false,
   };
@@ -39,13 +44,15 @@ function parseArgs() {
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--reference") opts.reference = args[++i];
+    else if (a === "--out") opts.out = args[++i];
     else if (a === "--dry-run") opts.dryRun = true;
     else if (a === "--stats") opts.stats = true;
     else if (a === "-h" || a === "--help") {
       console.error(`Usage: node apply-reference-layout.mjs <target-dir> [options]
 
 Options:
-  --reference <dir>   Reference decoded-organized directory
+  --reference <path>  Reference layout JSON or decoded-organized dir
+  --out <dir>         Write output to a new directory
   --dry-run           Show what would change
   --stats             Print statistics`);
       process.exit(0);
@@ -61,25 +68,114 @@ Options:
   return opts;
 }
 
+function loadLayoutJson(layoutPath) {
+  const raw = fs.readFileSync(layoutPath, "utf8");
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object" || !parsed.modules || typeof parsed.modules !== "object") {
+    throw new Error(`Invalid layout JSON (missing modules object): ${layoutPath}`);
+  }
+  return parsed.modules;
+}
+
+function loadManifestModules(manifestPath) {
+  const raw = fs.readFileSync(manifestPath, "utf8");
+  const parsed = JSON.parse(raw);
+  if (!parsed || typeof parsed !== "object" || !parsed.modules || typeof parsed.modules !== "object") {
+    throw new Error(`Invalid manifest (missing modules object): ${manifestPath}`);
+  }
+  return parsed.modules;
+}
+
+function findLayoutInDirectory(dirPath) {
+  if (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory()) return null;
+  const entries = fs.readdirSync(dirPath).filter(n => /^layout-v[\d.]+\.json$/.test(n)).sort().reverse();
+  if (entries.length === 0) return null;
+  return path.join(dirPath, entries[0]);
+}
+
+function resolveReferenceLayout(referenceOpt) {
+  const candidates = [];
+  if (referenceOpt) {
+    candidates.push(path.resolve(referenceOpt));
+  } else {
+    const cwdPrimary = path.join(process.cwd(), "versions", "2026-02-28_v2.1.63");
+    const cwdNestedPrimary = path.join(process.cwd(), "clau-decode", "versions", "2026-02-28_v2.1.63");
+    const srcPrimary = path.resolve(__dirname, "..", "versions", "2026-02-28_v2.1.63");
+    const siblingPrimary = path.resolve(__dirname, "..", "..", "clau-decode", "versions", "2026-02-28_v2.1.63");
+    candidates.push(path.join(cwdPrimary, "artifacts", "layout-v2.1.63.json"));
+    candidates.push(path.join(cwdPrimary, "decoded-organized"));
+    candidates.push(path.join(cwdNestedPrimary, "artifacts", "layout-v2.1.63.json"));
+    candidates.push(path.join(cwdNestedPrimary, "decoded-organized"));
+    candidates.push(path.join(srcPrimary, "artifacts", "layout-v2.1.63.json"));
+    candidates.push(path.join(srcPrimary, "decoded-organized"));
+    candidates.push(path.join(siblingPrimary, "artifacts", "layout-v2.1.63.json"));
+    candidates.push(path.join(siblingPrimary, "decoded-organized"));
+  }
+
+  for (const candidate of candidates) {
+    if (!candidate || !fs.existsSync(candidate)) continue;
+    const st = fs.statSync(candidate);
+    if (st.isFile()) {
+      if (path.extname(candidate) === ".json") {
+        const modules = loadLayoutJson(candidate);
+        return { modules, sourcePath: candidate, sourceKind: "layout-json" };
+      }
+      continue;
+    }
+    if (st.isDirectory()) {
+      const layoutJson = findLayoutInDirectory(candidate);
+      if (layoutJson) {
+        const modules = loadLayoutJson(layoutJson);
+        return { modules, sourcePath: layoutJson, sourceKind: "layout-json" };
+      }
+      const manifestPath = path.join(candidate, "manifest.json");
+      if (fs.existsSync(manifestPath)) {
+        const modules = loadManifestModules(manifestPath);
+        return { modules, sourcePath: manifestPath, sourceKind: "manifest-fallback" };
+      }
+    }
+  }
+
+  throw new Error(
+    `Could not resolve reference layout source${
+      referenceOpt ? ` from "${referenceOpt}"` : ""
+    }. Expected a layout JSON or decoded-organized directory with manifest.json.`,
+  );
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 const opts = parseArgs();
-const targetDir = path.resolve(opts.target);
-const refDir = path.resolve(opts.reference);
+const sourceTargetDir = path.resolve(opts.target);
+let targetDir = sourceTargetDir;
+if (opts.out) {
+  const outDir = path.resolve(opts.out);
+  if (opts.dryRun) {
+    console.log(`[dry-run] Would copy target to output dir: ${sourceTargetDir} -> ${outDir}`);
+  } else {
+    if (fs.existsSync(outDir)) {
+      console.error(`Error: output directory already exists: ${outDir}`);
+      process.exit(1);
+    }
+    fs.mkdirSync(path.dirname(outDir), { recursive: true });
+    fs.cpSync(sourceTargetDir, outDir, { recursive: true });
+    targetDir = outDir;
+  }
+}
 
-const refManifest = JSON.parse(fs.readFileSync(path.join(refDir, "manifest.json"), "utf8"));
+const { modules: refModules, sourcePath: refSourcePath, sourceKind: refSourceKind } = resolveReferenceLayout(opts.reference);
 const targetManifest = JSON.parse(fs.readFileSync(path.join(targetDir, "manifest.json"), "utf8"));
 
-console.log(`Reference: ${refDir}`);
+console.log(`Reference: ${refSourcePath} (${refSourceKind})`);
 console.log(`Target:    ${targetDir}`);
-console.log(`Modules:   ${Object.keys(refManifest.modules).length} ref, ${Object.keys(targetManifest.modules).length} target`);
+console.log(`Modules:   ${Object.keys(refModules).length} ref, ${Object.keys(targetManifest.modules).length} target`);
 console.log();
 
 // Detect concatenated vendor files in the reference (old resplit format:
 // multiple modules share vendor/<pkg>.js). For these, we keep individual files
 // but move them to vendor/<pkg>/ directory.
 const refFileCounts = {};
-for (const meta of Object.values(refManifest.modules)) {
+for (const meta of Object.values(refModules)) {
   refFileCounts[meta.file] = (refFileCounts[meta.file] || 0) + 1;
 }
 const concatenatedFiles = new Set(
@@ -98,7 +194,7 @@ const noTarget = [];    // modules in ref but not in target
 let alreadyCorrect = 0;
 
 for (const [modId, targetMeta] of Object.entries(targetManifest.modules)) {
-  const refMeta = refManifest.modules[modId];
+  const refMeta = refModules[modId];
   if (!refMeta) {
     noRef.push(modId);
     continue;
@@ -123,6 +219,14 @@ for (const [modId, targetMeta] of Object.entries(targetManifest.modules)) {
       refFile = `vendor/${pkg}/${String(idx).padStart(4, "0")}.js`;
     }
   }
+  // For non-concatenated vendor files: keep the original numeric basename (NNNN.js)
+  // from resplit, only change the directory to match the reference layout.
+  // This prevents vendor files from being renamed to descriptive names.
+  else if (refMeta.vendor) {
+    const targetBasename = path.basename(targetFile);   // e.g. "1198.js"
+    const refDirPart = path.dirname(refFile);           // e.g. "vendor/lodash"
+    refFile = path.join(refDirPart, targetBasename);    // "vendor/lodash/1198.js"
+  }
 
   if (targetFile === refFile) {
     alreadyCorrect++;
@@ -139,7 +243,7 @@ for (const [modId, targetMeta] of Object.entries(targetManifest.modules)) {
   });
 }
 
-for (const modId of Object.keys(refManifest.modules)) {
+for (const modId of Object.keys(refModules)) {
   if (!targetManifest.modules[modId]) noTarget.push(modId);
 }
 
@@ -167,7 +271,7 @@ if (opts.dryRun) {
 
 // ─── Execute moves ────────────────────────────────────────────────────────────
 
-let moved = 0, created = 0, skipped = 0;
+let moved = 0, skipped = 0;
 const createdDirs = new Set();
 const fileOrderMap = new Map(); // old path → new path
 
@@ -214,7 +318,7 @@ for (const m of moves) {
 }
 
 // Sync vendor flags for all modules (including those that didn't need moving)
-for (const [modId, refMeta] of Object.entries(refManifest.modules)) {
+for (const [modId, refMeta] of Object.entries(refModules)) {
   if (!targetManifest.modules[modId]) continue;
   targetManifest.modules[modId].vendor = !!refMeta.vendor;
   if (refMeta.vendorPackage) {
@@ -241,7 +345,8 @@ if (targetManifest.sourceOrder) {
 // Add metadata
 targetManifest._meta = {
   ...targetManifest._meta,
-  layoutAppliedFrom: refDir,
+  layoutAppliedFrom: refSourcePath,
+  layoutAppliedSourceKind: refSourceKind,
   layoutAppliedAt: new Date().toISOString(),
 };
 
