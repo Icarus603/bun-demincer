@@ -12,7 +12,6 @@ Bun binary (opaque executable)
   → split into individual modules (1 file per module)
   → classify vendor vs app modules (fingerprint DB + flood-fill)
   → deobfuscate (structural transforms + name recovery + formatting)
-  → reconstruct ES import/export statements
   → cluster modules by dependency graph (Louvain community detection)
   → organize into semantic directories
   → readable, organized source code
@@ -43,28 +42,25 @@ node src/match-vendors.mjs resplit/ --db data/vendor-fingerprints-1000.json --cl
 cp -r resplit/ decoded/
 node src/deobfuscate.mjs --dir decoded/
 
-# 5. Reconstruct ES imports/exports
-node src/reconstruct-imports.mjs decoded/
-
-# 6. Build dependency graph
+# 5. Build dependency graph
 node src/extract-deps.mjs decoded/manifest.json --out deps-graph.json
 
-# 7. Cluster modules (sweep resolutions, pick the best one)
+# 6. Cluster modules (sweep resolutions, pick the best one)
 node src/cluster-graph.mjs deps-graph.json --sweep
 node src/cluster-graph.mjs deps-graph.json --pick 1.5 --png
 #    → clusters-core.json (cluster membership)
 #    → clusters.png (visualization)
 
-# 8. Label clusters (create cluster-labels.json with directory names)
+# 7. Label clusters (create cluster-labels.json with directory names)
 #    Use the PNG + top functions per cluster to name them.
 #    See "Organizing modules" below for the format.
 
-# 9. Organize into semantic directories
+# 8. Organize into semantic directories
 node src/organize.mjs decoded/
 #    → decoded-organized/ with named directories + INDEX.md
 ```
 
-Steps 1-5 are fully automated. Steps 6-9 organize the output into directories — step 8 requires manual labeling (or an LLM).
+Steps 1-4 are fully automated. Steps 5-8 organize the output into directories — step 7 requires manual labeling (or an LLM).
 
 ### Round-trip: reassemble and run
 
@@ -82,7 +78,7 @@ The `--no-bun-cjs` flag wraps the code as a self-executing IIFE instead of relyi
 
 ### With AI-assisted renaming (optional, improves readability)
 
-After step 5, before organizing:
+After step 4, before organizing:
 
 ```bash
 # Batch rename: send each module to an LLM, get all renames at once
@@ -195,7 +191,6 @@ After deobfuscation, modules are flat numbered files. The organization pipeline 
 | `src/resplit.mjs` | Split bundle into 1-module-per-file |
 | `src/match-vendors.mjs` | Vendor classification: fingerprint DB + flood-fill. `--classify`, `--no-move` |
 | `src/deobfuscate.mjs` | Full pipeline: wakaru → lebab → extract → rename → prettier |
-| `src/reconstruct-imports.mjs` | Convert internal markers → ES import/export statements |
 | `build.mjs` (in project) | Reassemble modules into runnable bundle. `--no-bun-cjs`, `--run` |
 
 ### Name Recovery
