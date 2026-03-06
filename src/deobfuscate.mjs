@@ -24,8 +24,9 @@
 
 import fs from "fs";
 import path from "path";
+import vm from "vm";
 import { fileURLToPath } from "url";
-import { execSync } from "child_process";
+import { execSync, spawnSync } from "child_process";
 import { createRequire } from "module";
 
 const require = createRequire(import.meta.url);
@@ -48,6 +49,8 @@ function parseArgs() {
     skip: defaultSkip,
     only: null, // if set, run only this stage
     concurrency: 4,
+    strictWakaru: false,
+    wakaruRules: null, // null => SAFE_WAKARU_RULES, [] => no rules, [..] => explicit
   };
 
   let i = 0;
@@ -77,6 +80,27 @@ function parseArgs() {
         opts.concurrency = parseInt(args[++i], 10);
         i++;
         break;
+      case "--strict-wakaru":
+        opts.strictWakaru = true;
+        i++;
+        break;
+      case "--wakaru-rules": {
+        const raw = args[++i];
+        if (raw === undefined) {
+          console.error("Error: --wakaru-rules requires a value");
+          process.exit(1);
+        }
+        if (raw.trim().toLowerCase() === "none") {
+          opts.wakaruRules = [];
+        } else {
+          opts.wakaruRules = raw
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+        }
+        i++;
+        break;
+      }
       case "--help":
       case "-h":
         printUsage();
@@ -108,6 +132,8 @@ Options:
   --skip <stage>       Skip a stage (wakaru, lebab, extract, extract-names, rename, prettier)
   --only <stage>       Run only this stage
   --concurrency <n>    Max concurrent wakaru transforms (default: 4)
+  --strict-wakaru      Keep only wakaru transforms that are syntax-valid and idempotent
+  --wakaru-rules <v>   Comma-separated wakaru rules, or "none" for empty set
   -h, --help           Show this help
 
 Stages: wakaru → lebab → extract → extract-names → rename → prettier
@@ -122,52 +148,49 @@ Stages: wakaru → lebab → extract → extract-names → rename → prettier
 // Safe transform rules — excludes rules that break CJS bundles or conflict
 // with our pipeline. Rule order matches wakaru's default pipeline order.
 const SAFE_WAKARU_RULES = [
+  // Semantic-safe profile only: rules below are local syntactic canonicalization
+  // and avoid control-flow/scoping/evaluation-order rewrites.
+  //
+  // Explicitly excluded as semantically risky in this codebase:
+  // - un-curly-braces: wraps switch cases/flow bodies and can change lexical scope.
+  // - un-sequence-expression: rewrites control flow and evaluation order heavily.
+  // - un-variable-merging: hoists/splits declarations with heuristic for-loops.
+  // - un-assignment-merging: changes chained assignment order/value evaluation.
+  // - un-infinity: replaces 1/0 with Identifier Infinity (shadowing hazard).
+  // - un-flip-comparisons: swaps operand evaluation order.
+  //
   // 'prettier' — skip, we have our own prettier stage
   // 'module-mapping' — skip, may interfere with module system
-  "un-curly-braces",
-  "un-sequence-expression",
-  "un-variable-merging",
-  "un-assignment-merging",
-  "un-runtime-helper",
-  // 'un-esm' — skip, interferes with CJS wrapper
-  "un-enum",
-  // 'lebab' — skip, converts var→let/const which breaks reassembly (duplicate let in same scope)
-  "un-export-rename",
-  // 'un-use-strict' — skip, removing "use strict" is a behavioral change
-  // 'un-esmodule-flag' — skip, interferes with CJS interop
   "un-boolean",
-  "un-undefined",
-  "un-infinity",
   "un-typeof",
   "un-numeric-literal",
-  "un-template-literal",
   "un-bracket-notation",
-  "un-return",
-  "un-while-loop",
-  "un-indirect-call",
-  "un-type-constructor",
-  "un-builtin-prototype",
-  "un-sequence-expression",
-  "un-flip-comparisons",
-  "un-iife",
-  "un-import-rename",
-  // "smart-inline" — disabled: can rewrite loop/index vars incorrectly (runtime breakage)
-  // 'smart-rename' — skip, conflicts with our rename pipeline
-  // "un-optional-chaining" — disabled: observed to drop enum namespace var declarations
-  "un-nullish-coalescing",
-  "un-conditionals",
-  "un-sequence-expression",
-  "un-parameters",
-  "un-argument-spread",
-  // 'un-jsx' — skip, converts createElement to JSX (breaks CJS in Bun)
-  "un-es6-class",
-  "un-async-await",
   // 'prettier-1' — skip, we have our own prettier stage
 ];
 
-async function stageWakaru(dir, files, concurrency) {
+function validateJavaScriptSyntax(code, filename) {
+  try {
+    new vm.Script(code, { filename });
+    return null;
+  } catch (err) {
+    return err;
+  }
+}
+
+function resolveWakaruRules(wakaruRulesOpt) {
+  if (Array.isArray(wakaruRulesOpt)) {
+    return wakaruRulesOpt;
+  }
+  return SAFE_WAKARU_RULES;
+}
+
+async function stageWakaru(dir, files, concurrency, strictWakaru = false, wakaruRulesOpt = null) {
+  const activeRules = resolveWakaruRules(wakaruRulesOpt);
   console.log("\n━━━ Stage 1: wakaru unminify ━━━");
-  console.log(`  Using programmatic API with ${SAFE_WAKARU_RULES.length} safe rules`);
+  console.log(
+    `  Using programmatic API with ${activeRules.length} rules` +
+      (strictWakaru ? " (strict mode enabled)" : ""),
+  );
 
   const LARGE_FILE_THRESHOLD = 500_000; // 500KB
 
@@ -195,22 +218,51 @@ async function stageWakaru(dir, files, concurrency) {
   async function transformFile(f) {
     const filePath = path.join(dir, f);
     const source = fs.readFileSync(filePath, "utf-8");
+    const tick = () => {
+      process.stdout.write(
+        `  ${path.basename(dir)}: ${processed + errors}/${files.length} files\r`
+      );
+    };
+
     try {
       const result = await runTransformationRules(
         { path: f, source },
-        SAFE_WAKARU_RULES,
+        activeRules,
       );
-      if (result.code && result.code !== source) {
-        fs.writeFileSync(filePath, result.code, "utf-8");
+      const transformedCode = result.code ?? source;
+
+      if (strictWakaru && transformedCode !== source) {
+        const syntaxErr = validateJavaScriptSyntax(transformedCode, f);
+        if (syntaxErr) {
+          console.warn(`  Warning: strict-wakaru rejected ${f} (syntax): ${syntaxErr.message}`);
+          errors++;
+          tick();
+          return;
+        }
+
+        // Determinism gate: applying the same rules again should be a no-op.
+        const secondPass = await runTransformationRules(
+          { path: f, source: transformedCode },
+          activeRules,
+        );
+        const secondCode = secondPass.code ?? transformedCode;
+        if (secondCode !== transformedCode) {
+          console.warn(`  Warning: strict-wakaru rejected ${f} (non-idempotent output)`);
+          errors++;
+          tick();
+          return;
+        }
+      }
+
+      if (transformedCode !== source) {
+        fs.writeFileSync(filePath, transformedCode, "utf-8");
       }
       processed++;
     } catch (err) {
       console.warn(`  Warning: wakaru failed on ${f}: ${err.message}`);
       errors++;
     }
-    process.stdout.write(
-      `  ${path.basename(dir)}: ${processed + errors}/${files.length} files\r`
-    );
+    tick();
   }
 
   // Process large files one at a time
@@ -459,41 +511,36 @@ function stageRename(dir, batchFiles, manifestPath, skipFiles) {
   const tmpBatch = path.join(dir, ".rename-batch-tmp.json");
   fs.writeFileSync(tmpBatch, JSON.stringify(merged, null, 2));
 
-  const manifestFlag = manifestPath ? ` --manifest "${manifestPath}"` : "";
+  const renameArgs = [
+    renameMjs,
+    "--batch",
+    tmpBatch,
+    "--dir",
+    dir,
+  ];
+  if (manifestPath) {
+    renameArgs.push("--manifest", manifestPath);
+  }
+  renameArgs.push("--smart");
   try {
-    const output = execSync(
-      `node "${renameMjs}" --batch "${tmpBatch}" --dir "${dir}"${manifestFlag} --smart`,
-      {
-        cwd: __dirname,
-        stdio: ["pipe", "pipe", "pipe"],
-        timeout: 600000,
-        maxBuffer: 50 * 1024 * 1024, // 50MB — full batch output can be very large
-      }
-    );
-    const lines = output.toString().split("\n");
-    for (const line of lines) {
-      if (line.trim()) console.log(`  ${line}`);
+    // Stream output live so long rename passes don't look "stuck".
+    const result = spawnSync("node", renameArgs, {
+      cwd: __dirname,
+      stdio: "inherit",
+      timeout: 600000,
+    });
+
+    if (result.error) {
+      throw result.error;
+    }
+    if (result.signal) {
+      throw new Error(`Rename process killed by signal ${result.signal}`);
+    }
+    if (typeof result.status === "number" && result.status !== 0) {
+      throw new Error(`Rename stage failed with exit code ${result.status}`);
     }
   } catch (err) {
-    // CRITICAL: maxBuffer overflow kills the rename process mid-way,
-    // leaving some files renamed and others not. Always report this.
-    const killed = err.killed || err.signal;
-    if (killed) {
-      console.error(`  ERROR: rename process was killed (${err.signal || 'maxBuffer?'}) — renames incomplete!`);
-    }
-    if (err.stdout) {
-      const lines = err.stdout.toString().split("\n");
-      for (const line of lines) {
-        if (line.trim()) console.log(`  ${line}`);
-      }
-    }
-    if (err.stderr) {
-      console.warn(`  Rename stderr: ${err.stderr.toString().slice(0, 500)}`);
-    }
-    const reason = killed
-      ? "Rename process killed (possibly maxBuffer overflow) — renames may be incomplete"
-      : `Rename stage failed with exit code ${err.status ?? "unknown"}`;
-    throw new Error(reason);
+    throw new Error(err.message || "Rename stage failed");
   } finally {
     // Clean up
     fs.rmSync(tmpBatch, { force: true });
@@ -617,7 +664,13 @@ async function main() {
 
     switch (stage) {
       case "wakaru":
-        await stageWakaru(dir, allFiles, opts.concurrency);
+        await stageWakaru(
+          dir,
+          allFiles,
+          opts.concurrency,
+          opts.strictWakaru,
+          opts.wakaruRules,
+        );
         break;
       case "lebab":
         stageLebab(dir, allFiles);
