@@ -248,6 +248,7 @@ function buildManifestIndices(manifest, files, dir = null) {
   const ownerByModule = new Map();
   const reverseDeps = new Map();
   const filesSet = new Set(files);
+  const vendorFiles = buildVendorFileSet(manifest);
 
   if (manifest?.sourceOrder && Array.isArray(manifest.sourceOrder)) {
     for (const entry of manifest.sourceOrder) {
@@ -332,7 +333,7 @@ function buildManifestIndices(manifest, files, dir = null) {
     interfaceLinkMap.set(moduleName, linked);
   }
 
-  return { moduleNames, interfaceLinkMap };
+  return { moduleNames, interfaceLinkMap, vendorFiles };
 }
 
 function splitSmartRenames(flatRenames, moduleNames) {
@@ -366,12 +367,54 @@ function filterReservedAndBuiltins(renames) {
   return { filtered, skipped };
 }
 
-function isVendorFile(file) {
+function dropDuplicateTargetRenames(renames, label, blockedTargets = new Set()) {
+  const seenTargets = new Map(); // target -> first oldName kept
+  const dropped = [];
+
+  for (const [oldName, newName] of Object.entries(renames)) {
+    if (blockedTargets.has(newName)) {
+      dropped.push(`${oldName} → ${newName} (target reserved by higher-priority pass)`);
+      delete renames[oldName];
+      continue;
+    }
+
+    const existing = seenTargets.get(newName);
+    if (existing) {
+      dropped.push(`${oldName} → ${newName} (kept ${existing} → ${newName})`);
+      delete renames[oldName];
+      continue;
+    }
+
+    seenTargets.set(newName, oldName);
+  }
+
+  if (dropped.length > 0) {
+    console.warn(`Safety: skipped ${dropped.length} ${label} rename(s) with duplicate/conflicting targets`);
+    if (process.env.RENAME_DEBUG) {
+      console.warn(`  [DEBUG] ${label} duplicate target skips: ${dropped.join(", ")}`);
+    }
+  }
+
+  return dropped.length;
+}
+
+function buildVendorFileSet(manifest) {
+  const vendorFiles = new Set();
+  if (!isPlainObject(manifest?.modules)) return vendorFiles;
+  for (const meta of Object.values(manifest.modules)) {
+    if (!meta || typeof meta.file !== "string") continue;
+    if (meta.vendor) vendorFiles.add(meta.file);
+  }
+  return vendorFiles;
+}
+
+function isVendorFile(file, vendorFiles = null) {
+  if (vendorFiles && vendorFiles.has(file)) return true;
   return file.startsWith("vendor/");
 }
 
-function filterFilesByScope(files, scope) {
-  if (scope === "app") return files.filter((file) => !isVendorFile(file));
+function filterFilesByScope(files, scope, vendorFiles = null) {
+  if (scope === "app") return files.filter((file) => !isVendorFile(file, vendorFiles));
   return files;
 }
 
@@ -417,7 +460,7 @@ function makeIdentifierRegex(identifier) {
   return new RegExp(`(^|[^A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`);
 }
 
-function findCrossBoundaryLocalNames(localRenames, files, dir) {
+function findCrossBoundaryLocalNames(localRenames, files, dir, vendorFiles = null) {
   const renameNames = Object.keys(localRenames);
   if (renameNames.length === 0) return [];
 
@@ -441,7 +484,7 @@ function findCrossBoundaryLocalNames(localRenames, files, dir) {
       continue;
     }
 
-    if (isVendorFile(file)) {
+    if (isVendorFile(file, vendorFiles)) {
       let m;
       identRe.lastIndex = 0;
       while ((m = identRe.exec(code)) !== null) {
@@ -503,6 +546,7 @@ function runRenamePass({
   dir,
   dryRun,
   linkMap = null,
+  vendorFiles = null,
 }) {
   const loaded = Object.keys(renames).length;
   if (loaded === 0) {
@@ -554,7 +598,7 @@ function runRenamePass({
     const replacementCount = Object.values(counts).reduce((sum, n) => sum + n, 0);
     totalReplacements += replacementCount;
 
-    const bucket = isVendorFile(file) ? "vendor" : "app";
+    const bucket = isVendorFile(file, vendorFiles) ? "vendor" : "app";
     scopedCounts[bucket].files_modified++;
     scopedCounts[bucket].replacements += replacementCount;
 
@@ -897,6 +941,7 @@ function extractFileNumber(filePath) {
  */
 function resolveCollisions(renames, manifestPath, dir) {
   const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+  const manifestVendorFiles = buildVendorFileSet(manifest);
 
   // Build var → file map from manifest and collect all module variable names.
   // Module variables that are NOT being renamed must not be used as rename targets,
@@ -910,7 +955,9 @@ function resolveCollisions(renames, manifestPath, dir) {
     }
   }
 
-  // Scan ALL files (app + vendor) for file-level declarations.
+  // Scan ALL files (app + vendor) for bundle-scope bindings:
+  // - file-level declarations (var/let/const/function/class)
+  // - implicit globals from bare assignments to undeclared identifiers
   // This catches collisions where renames target names already used by vendor code
   // (e.g., multiple AWS SDK modules each declaring `class Client`).
   const fileLevelDecls = new Map(); // name → [{file, kind}]
@@ -919,24 +966,38 @@ function resolveCollisions(renames, manifestPath, dir) {
   const varRe = /(?:^|[;{}])\s*(?:var|let|const)\s+([A-Za-z_$][\w$]*)/gm;
   const funcRe = /(?:^|[;{}])\s*function\s+([A-Za-z_$][\w$]*)/gm;
   const classRe = /(?:^|[;{}])\s*class\s+([A-Za-z_$][\w$]*)/gm;
+  const assignRe = /(?:^|[;,(\[])\s*([A-Za-z_$][\w$]*)\s*=(?!=|>)/gm;
 
   for (const f of allFiles) {
     const code = fs.readFileSync(path.join(dir, f), "utf-8");
+    const vendor = isVendorFile(f, manifestVendorFiles);
+    const declaredInFile = new Set();
     let m;
     varRe.lastIndex = 0;
     funcRe.lastIndex = 0;
     classRe.lastIndex = 0;
+    assignRe.lastIndex = 0;
     while ((m = varRe.exec(code)) !== null) {
+      declaredInFile.add(m[1]);
       if (!fileLevelDecls.has(m[1])) fileLevelDecls.set(m[1], []);
-      fileLevelDecls.get(m[1]).push({ file: f, kind: "var" });
+      fileLevelDecls.get(m[1]).push({ file: f, kind: "var", vendor });
     }
     while ((m = funcRe.exec(code)) !== null) {
+      declaredInFile.add(m[1]);
       if (!fileLevelDecls.has(m[1])) fileLevelDecls.set(m[1], []);
-      fileLevelDecls.get(m[1]).push({ file: f, kind: "function" });
+      fileLevelDecls.get(m[1]).push({ file: f, kind: "function", vendor });
     }
     while ((m = classRe.exec(code)) !== null) {
+      declaredInFile.add(m[1]);
       if (!fileLevelDecls.has(m[1])) fileLevelDecls.set(m[1], []);
-      fileLevelDecls.get(m[1]).push({ file: f, kind: "class" });
+      fileLevelDecls.get(m[1]).push({ file: f, kind: "class", vendor });
+    }
+    while ((m = assignRe.exec(code)) !== null) {
+      const name = m[1];
+      // Assignment to a declared local is not a bundle-scope binding.
+      if (declaredInFile.has(name)) continue;
+      if (!fileLevelDecls.has(name)) fileLevelDecls.set(name, []);
+      fileLevelDecls.get(name).push({ file: f, kind: "assign", vendor });
     }
   }
 
@@ -966,10 +1027,12 @@ function resolveCollisions(renames, manifestPath, dir) {
   // 1. From file-level declaration scan
   for (const [name, entries] of fileLevelDecls) {
     if (name in renames) continue;
-    const hasAppDecl = entries.some(e => !e.file.startsWith("vendor/"));
-    const hasVendorDecl = entries.some(e => e.file.startsWith("vendor/"));
+    const hasAppDecl = entries.some((e) => !e.vendor);
+    const hasVendorDecl = entries.some((e) => e.vendor);
     if (hasAppDecl || hasVendorDecl) unrenamedNames.add(name);
-    const hasVendorClassFunc = entries.some(e => e.file.startsWith("vendor/") && (e.kind === "class" || e.kind === "function"));
+    const hasVendorClassFunc = entries.some(
+      (e) => e.vendor && (e.kind === "class" || e.kind === "function")
+    );
     if (hasVendorClassFunc && !hasAppDecl) unrenamedVendorClassNames.add(name);
   }
 
@@ -1063,7 +1126,13 @@ function main() {
   const { flatRenames, interfaceRenames: explicitInterface, localRenames: explicitLocal } =
     loadRenameInputs(opts);
 
-  const { moduleNames, interfaceLinkMap } = buildManifestIndices(manifestData, allFiles, dir);
+  const { moduleNames, interfaceLinkMap, vendorFiles } = buildManifestIndices(manifestData, allFiles, dir);
+  const hasVendorClassification =
+    vendorFiles.size > 0 || allFiles.some((file) => file.startsWith("vendor/"));
+  const moduleCount = isPlainObject(manifestData?.modules)
+    ? Object.keys(manifestData.modules).length
+    : allFiles.length;
+  const likelyBundledCodebase = moduleCount > 200;
 
   let interfaceRenames = {};
   let localRenames = {};
@@ -1106,8 +1175,12 @@ function main() {
     const interfaceFiltered = filterReservedAndBuiltins(interfaceRenames);
     interfaceRenames = interfaceFiltered.filtered;
     skippedReserved.push(...interfaceFiltered.skipped.map((s) => `[interface] ${s}`));
+    dropDuplicateTargetRenames(interfaceRenames, "interface");
 
-    const crossBoundaryLocal = findCrossBoundaryLocalNames(localRenames, allFiles, dir);
+    const interfaceTargets = new Set(Object.values(interfaceRenames));
+    dropDuplicateTargetRenames(localRenames, "local", interfaceTargets);
+
+    const crossBoundaryLocal = findCrossBoundaryLocalNames(localRenames, allFiles, dir, vendorFiles);
     if (crossBoundaryLocal.length > 0) {
       for (const oldName of crossBoundaryLocal) {
         delete localRenames[oldName];
@@ -1123,6 +1196,24 @@ function main() {
     const localFiltered = filterReservedAndBuiltins(localRenames);
     localRenames = localFiltered.filtered;
     skippedReserved.push(...localFiltered.skipped.map((s) => `[local] ${s}`));
+
+    const requestedLocalScope = opts.scope || "app";
+    const allowUnclassifiedLocal = process.env.RENAME_ALLOW_UNCLASSIFIED_LOCAL === "1";
+    if (
+      requestedLocalScope === "app" &&
+      Object.keys(localRenames).length > 0 &&
+      !hasVendorClassification &&
+      likelyBundledCodebase &&
+      !allowUnclassifiedLocal
+    ) {
+      console.warn(
+        `Safety: skipped ${Object.keys(localRenames).length} local rename(s) because vendor classification is missing`
+      );
+      console.warn(
+        "  Tip: classify resplit modules first (e.g. match-vendors --classify), or set RENAME_ALLOW_UNCLASSIFIED_LOCAL=1 to force"
+      );
+      localRenames = {};
+    }
   } else {
     singleRenames = { ...flatRenames, ...explicitInterface, ...explicitLocal };
     const singleFiltered = filterReservedAndBuiltins(singleRenames);
@@ -1141,8 +1232,8 @@ function main() {
   if (opts.smart) {
     const interfaceScope = "all";
     const localScope = opts.scope || "app";
-    const interfaceFiles = filterFilesByScope(allFiles, interfaceScope);
-    const localFiles = filterFilesByScope(allFiles, localScope);
+    const interfaceFiles = filterFilesByScope(allFiles, interfaceScope, vendorFiles);
+    const localFiles = filterFilesByScope(allFiles, localScope, vendorFiles);
 
     console.log(
       `${opts.dryRun ? "[DRY RUN] " : ""}Smart rename in ${dir}: ` +
@@ -1162,6 +1253,7 @@ function main() {
       dir,
       dryRun: opts.dryRun,
       linkMap: interfaceLinkMap,
+      vendorFiles,
     });
     interfacePass.suffixed = interfaceCollision.collisionsSuffixed;
     interfacePass.skipped = interfaceCollision.collisionsSkipped;
@@ -1179,13 +1271,14 @@ function main() {
       files: localFiles,
       dir,
       dryRun: opts.dryRun,
+      vendorFiles,
     });
     localPass.suffixed = localCollision.collisionsSuffixed;
     localPass.skipped = localCollision.collisionsSkipped;
     passes.push(localPass);
   } else {
     const scope = opts.scope || "all";
-    const files = filterFilesByScope(allFiles, scope);
+    const files = filterFilesByScope(allFiles, scope, vendorFiles);
     console.log(
       `${opts.dryRun ? "[DRY RUN] " : ""}Renaming ${Object.keys(singleRenames).length} identifier(s) ` +
       `across ${files.length} file(s) in ${dir} (scope: ${scope})`
@@ -1204,6 +1297,7 @@ function main() {
       files,
       dir,
       dryRun: opts.dryRun,
+      vendorFiles,
     });
     pass.suffixed = collision.collisionsSuffixed;
     pass.skipped = collision.collisionsSkipped;
