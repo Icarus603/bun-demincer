@@ -23,3 +23,6 @@ clusters*.png
 
 # Reassembled bundles
 reassembled.js
+
+# Working directories (managed as separate repos)
+work/
