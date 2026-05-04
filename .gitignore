@@ -23,3 +23,8 @@ clusters*.png
 
 # Reassembled bundles
 reassembled.js
+
+# decode.sh / delta.sh runtime artifacts (per-machine, regenerated)
+work/
+deltas/
+runs.log
