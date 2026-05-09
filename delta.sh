@@ -34,7 +34,13 @@ if [[ "${1:-}" == "--auto" ]]; then
         exit 1
     fi
     # Collect "X.Y.Z" tokens from work/claude-code-X.Y.Z/decoded/.
-    mapfile -t versions < <(
+    # macOS ships bash 3.2 — no `mapfile`, no negative-index slices. Use a
+    # while-read loop and explicit ${arr[$((n-1))]} indexing, which works
+    # on every POSIX-ish bash from 3.0 onward.
+    versions=()
+    while IFS= read -r v; do
+        versions+=("$v")
+    done < <(
         find "$WORK_DIR" -mindepth 1 -maxdepth 1 -type d -name 'claude-code-*' |
             while read -r d; do
                 ver="${d##*claude-code-}"
@@ -49,9 +55,10 @@ if [[ "${1:-}" == "--auto" ]]; then
         log "ERROR: --auto needs ≥2 fully-decoded versions, found ${#versions[@]}"
         exit 1
     fi
-    A="${versions[-2]}"
-    B="${versions[-1]}"
-    log "auto-pick: ${A} → ${B} (newest pair of ${#versions[@]} decoded)"
+    n=${#versions[@]}
+    A="${versions[$((n-2))]}"
+    B="${versions[$((n-1))]}"
+    log "auto-pick: ${A} → ${B} (newest pair of ${n} decoded)"
 elif [[ $# -lt 2 ]]; then
     echo "Usage: $0 <version-a> <version-b>" >&2
     echo "       $0 --auto" >&2
