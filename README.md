@@ -1,5 +1,15 @@
 # bun-demincer
 
+> **Vendored fork.** This directory is a fork of
+> [vicnaum/bun-demincer](https://github.com/vicnaum/bun-demincer)
+> (no license declared upstream). The fork lives independently at
+> [Icarus603/bun-demincer](https://github.com/Icarus603/bun-demincer)
+> and is folded into this monorepo for convenience: it powers the
+> daily ant-claude-code reverse-engineering pipeline driven by
+> `check-and-update.sh` + `analyzer/`. All upstream credit goes to
+> vicnaum; the `scheduler/`, `analyzer/`, `analyze.sh`, and
+> `check-and-update.sh` additions are local Icarus work.
+
 Decompiler, deminifier, and deobfuscator for [Bun](https://bun.sh)-compiled standalone JavaScript binaries.
 
 Extracts embedded JavaScript source from Bun's binary format, splits it into individual modules, identifies vendor (npm) packages, recovers original identifiers, and organizes everything into a readable, structured codebase — from a single compiled binary.
