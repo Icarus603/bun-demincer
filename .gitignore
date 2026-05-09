@@ -24,7 +24,11 @@ clusters*.png
 # Reassembled bundles
 reassembled.js
 
-# decode.sh / delta.sh runtime artifacts (per-machine, regenerated)
+# decode.sh / delta.sh / analyze.sh runtime artifacts (per-machine, regenerated)
 work/
 deltas/
+reports/
 runs.log
+.launchd-stdout.log
+.launchd-stderr.log
+.update.lockdir/
